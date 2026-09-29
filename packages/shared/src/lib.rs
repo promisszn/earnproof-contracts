@@ -387,7 +387,7 @@ pub enum IssuerError {
     IssuerInactive = 205,
     InvalidTransition = 206,
     InvalidAddress = 207,
-    InvalidMetadataCommitment = 208,
+    InvalidMetadataCommitment = 211,
     /// Registering or reactivating this issuer would exceed the governed
     /// maximum active-issuer capacity.
     IssuerCapacityExceeded = 208,
@@ -522,6 +522,8 @@ pub enum ProofValidity {
     Expired,
     IssuerInactive,
     SchemaDeprecated,
+}
+
 /// Stores temporal metadata for an upgrade approval.
 ///
 /// # Timing invariants

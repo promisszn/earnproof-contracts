@@ -155,7 +155,7 @@ pub struct ErrorSpec {
 }
 
 /// Every published error, ordered by code.
-pub const ERROR_CATALOG: [ErrorSpec; 25] = [
+pub const ERROR_CATALOG: [ErrorSpec; 29] = [
     ErrorSpec {
         code: 1,
         name: "AlreadyInitialized",

@@ -1,8 +1,9 @@
 #![no_std]
 
 use earnproof_shared::{
-    ContractError, GenesisRecord, IssuerError, IssuerRecord, IssuerStatus, MigrationStatus,
-    TtlStatus, UpgradeApproval, UpgradeReceipt, MAX_MIGRATION_BATCH, MIGRATION_STATUS_VERSION,
+    ContractError, GenesisRecord, InterfaceVersion, IssuerError, IssuerRecord, IssuerStatus,
+    MigrationStatus, TtlStatus, UpgradeApproval, UpgradeReceipt, ISSUER_REGISTRY_INTERFACE_VERSION,
+    MAX_MIGRATION_BATCH, METADATA_REVISION_INITIAL, MIGRATION_STATUS_VERSION,
     TTL_EXTEND_TO_LEDGERS, TTL_THRESHOLD_LEDGERS, UPGRADE_APPROVAL_EXPIRY_LEDGERS,
     UPGRADE_TIMELOCK_LEDGERS,
 };
@@ -32,6 +33,11 @@ enum DataKey {
     UpgradeApproval,
     /// Immutable deployment identity, written once at `initialize`.
     Genesis,
+    IssuerEpoch,
+    MaxActiveIssuers,
+    ActiveIssuerCount,
+    ReactivationCooldown,
+    ReactivatableAt(BytesN<32>),
 }
 
 #[contractevent]
@@ -295,6 +301,8 @@ impl IssuerRegistryContract {
             .instance()
             .get(&DataKey::Genesis)
             .ok_or(ContractError::NotInitialized)
+    }
+
     pub fn nominate_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
         Self::ensure_not_decommissioned(&env).map_err(|_| ContractError::InvalidState)?;
         let admin = Self::get_admin(env.clone())?;
@@ -553,6 +561,7 @@ impl IssuerRegistryContract {
             metadata_uri_hash,
             metadata_revision,
             updated_at: now,
+            epoch,
         }
         .publish(&env);
         Ok(())
@@ -617,6 +626,7 @@ impl IssuerRegistryContract {
         env.storage().persistent().set(&key, &record);
         Self::extend_issuer_key_ttl(env.clone(), &key);
 
+        let epoch = Self::bump_epoch(&env);
         IssuerMetadataUpdated {
             issuer_id_hash,
             metadata_hash,
@@ -2609,6 +2619,8 @@ mod test {
 
         let result = client.try_get_genesis();
         assert_eq!(result, Err(Ok(ContractError::NotInitialized)));
+    }
+
     // ── issuer metadata URI hash commitments (issue 179) ───────────────────────
 
     #[test]

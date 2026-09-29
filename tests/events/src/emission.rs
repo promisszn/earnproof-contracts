@@ -372,6 +372,10 @@ fn a_rejected_registration_publishes_no_event_and_does_not_advance_the_epoch() {
         deployment.proofs.get_registry_epoch(),
         epoch_before,
         "a rejected call must not advance the registry epoch"
+    );
+}
+
+#[test]
 fn proof_registry_emits_proof_registered_on_registration() {
     // proof-registry publishes exactly one `proof_registered` event on a
     // successful registration, carrying the on-chain creation timing so an
