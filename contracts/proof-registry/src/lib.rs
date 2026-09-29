@@ -2,9 +2,10 @@
 
 #[allow(unused_imports)]
 use earnproof_shared::{
-    ContractError, GenesisRecord, MigrationStatus, PauseScope, ProofError, ProofPayloadRecord,
-    ProofRecord, ProofStatus, TtlStatus, UpgradeApproval, UpgradeReceipt, MAX_MIGRATION_BATCH,
-    MIGRATION_STATUS_VERSION, TTL_EXTEND_TO_LEDGERS, TTL_THRESHOLD_LEDGERS,
+    is_interface_compatible, ContractError, GenesisRecord, InterfaceVersion, MigrationStatus,
+    PauseScope, ProofError, ProofPayloadRecord, ProofRecord, ProofStatus, ProofValidity,
+    SchemaRateLimit, SchemaRateLimitUsage, TtlStatus, UpgradeApproval, UpgradeReceipt,
+    MAX_MIGRATION_BATCH, MIGRATION_STATUS_VERSION, TTL_EXTEND_TO_LEDGERS, TTL_THRESHOLD_LEDGERS,
 };
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
@@ -24,6 +25,7 @@ pub trait ProtocolConfigInterface {
     fn is_scope_paused(env: Env, scope: PauseScope) -> bool;
     fn is_schema_version_approved(env: Env, version: u32) -> bool;
     fn get_schema_payload_limit(env: Env, version: u32) -> u32;
+    fn get_schema_rate_limit(env: Env, version: u32) -> SchemaRateLimit;
     fn interface_version(env: Env) -> InterfaceVersion;
 }
 
@@ -57,6 +59,10 @@ enum DataKey {
     /// Bounded auxiliary-payload metadata for a proof registered with a
     /// payload (length and commitment hash only — never the raw bytes).
     ProofPayloadMeta(BytesN<32>),
+    SchemaRateUsage(u32, u32),
+    IssuerProofCaps(Address),
+    IssuerActiveProofCount(Address),
+    IssuerLifetimeProofCount(Address),
     PendingAdmin,
 }
 
@@ -104,19 +110,6 @@ pub struct ContractUpgraded {
     pub upgraded_by: Address,
 }
 
-/// Emitted when a proof is registered.
-///
-/// Carries the on-chain creation timing (`created_ledger` and `created_at`)
-/// so indexers can record deterministic audit timestamps without a follow-up
-/// query. Both values are sourced from the host ledger environment.
-#[contractevent]
-pub struct ProofRegistered {
-    pub proof_id_hash: BytesN<32>,
-    pub issuer_address: Address,
-    pub schema_version: u32,
-    pub created_ledger: u32,
-    pub created_at: u64,
-    pub expires_at: u64,
 #[contractevent]
 pub struct SuccessorNominated {
     pub successor: Address,
@@ -368,6 +361,9 @@ impl ProofRegistryContract {
             return Err(ProofError::ProofAlreadyRegistered);
         }
 
+        Self::consume_schema_rate_limit(&env, &protocol_client, schema_version)?;
+        Self::consume_issuer_proof_capacity(&env, &issuer_address)?;
+
         // Creation timing is sourced only from the host ledger environment so
         // it is deterministic and non-forgeable by the caller. The proof
         // record and its timing are written together in a single persistent
@@ -462,6 +458,9 @@ impl ProofRegistryContract {
             return Err(ProofError::ProofAlreadyRegistered);
         }
 
+        Self::consume_schema_rate_limit(&env, &protocol_client, schema_version)?;
+        Self::consume_issuer_proof_capacity(&env, &issuer_address)?;
+
         let now = env.ledger().timestamp();
         let record = ProofRecord {
             proof_id_hash: proof_id_hash.clone(),
@@ -472,6 +471,7 @@ impl ProofRegistryContract {
             expires_at,
             created_at: now,
             revoked_at: 0,
+            created_ledger: env.ledger().sequence(),
         };
         env.storage().persistent().set(&key, &record);
         Self::extend_proof_key_ttl(env.clone(), &key);
@@ -491,14 +491,6 @@ impl ProofRegistryContract {
             payload_len,
             payload_hash,
             epoch,
-
-        ProofRegistered {
-            proof_id_hash,
-            issuer_address,
-            schema_version,
-            created_ledger,
-            created_at: now,
-            expires_at,
         }
         .publish(&env);
         Ok(())
@@ -970,6 +962,11 @@ impl ProofRegistryContract {
 
         record.status = ProofStatus::Revoked;
         record.revoked_at = env.ledger().timestamp();
+        let active_key = DataKey::IssuerActiveProofCount(record.issuer_address.clone());
+        let active: u32 = env.storage().persistent().get(&active_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&active_key, &active.saturating_sub(1));
         env.storage().persistent().set(&key, &record);
         Self::extend_proof_key_ttl(env.clone(), &key);
         let epoch = Self::bump_registry_epoch(&env);
@@ -980,6 +977,119 @@ impl ProofRegistryContract {
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Admin-only issuer proof capacity. Reductions below active usage are rejected.
+    pub fn set_issuer_proof_caps(
+        env: Env,
+        issuer: Address,
+        max_active: u32,
+        max_lifetime: u32,
+    ) -> Result<(), ProofError> {
+        let admin = Self::get_admin(env.clone()).map_err(|_| ProofError::ProofNotFound)?;
+        Self::require_auth(&admin);
+        let active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerActiveProofCount(issuer.clone()))
+            .unwrap_or(0);
+        let lifetime: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerLifetimeProofCount(issuer.clone()))
+            .unwrap_or(0);
+        if max_active < active || max_lifetime < lifetime {
+            return Err(ProofError::MalformedInput);
+        }
+        env.storage().persistent().set(
+            &DataKey::IssuerProofCaps(issuer),
+            &(max_active, max_lifetime),
+        );
+        Ok(())
+    }
+    pub fn get_issuer_proof_usage(env: Env, issuer: Address) -> (u32, u32, u32, u32) {
+        let (max_active, max_lifetime) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerProofCaps(issuer.clone()))
+            .unwrap_or((u32::MAX, u32::MAX));
+        let active = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerActiveProofCount(issuer.clone()))
+            .unwrap_or(0);
+        let lifetime = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerLifetimeProofCount(issuer))
+            .unwrap_or(0);
+        (active, lifetime, max_active, max_lifetime)
+    }
+    fn consume_issuer_proof_capacity(env: &Env, issuer: &Address) -> Result<(), ProofError> {
+        let (active, lifetime, max_active, max_lifetime) =
+            Self::get_issuer_proof_usage(env.clone(), issuer.clone());
+        if active >= max_active || lifetime >= max_lifetime {
+            return Err(ProofError::MalformedInput);
+        }
+        env.storage().persistent().set(
+            &DataKey::IssuerActiveProofCount(issuer.clone()),
+            &active.checked_add(1).ok_or(ProofError::MalformedInput)?,
+        );
+        env.storage().persistent().set(
+            &DataKey::IssuerLifetimeProofCount(issuer.clone()),
+            &lifetime.checked_add(1).ok_or(ProofError::MalformedInput)?,
+        );
+        Ok(())
+    }
+
+    fn consume_schema_rate_limit(
+        env: &Env,
+        config: &ProtocolConfigContractClient,
+        schema: u32,
+    ) -> Result<(), ProofError> {
+        let policy = config.get_schema_rate_limit(&schema);
+        if policy.window_ledgers == 0 {
+            return Err(ProofError::MalformedInput);
+        }
+        let ledger = env.ledger().sequence();
+        let start = ledger - ledger % policy.window_ledgers;
+        let key = DataKey::SchemaRateUsage(schema, start);
+        let used: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        if used >= policy.max_registrations {
+            return Err(ProofError::MalformedInput);
+        }
+        let next = used.checked_add(1).ok_or(ProofError::MalformedInput)?;
+        env.storage().persistent().set(&key, &next);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+        Ok(())
+    }
+
+    pub fn get_schema_rate_limit_usage(
+        env: Env,
+        schema: u32,
+    ) -> Result<SchemaRateLimitUsage, ProofError> {
+        let config =
+            Self::get_protocol_config(env.clone()).map_err(|_| ProofError::ProofNotFound)?;
+        let policy =
+            ProtocolConfigContractClient::new(&env, &config).get_schema_rate_limit(&schema);
+        if policy.window_ledgers == 0 {
+            return Err(ProofError::MalformedInput);
+        }
+        let ledger = env.ledger().sequence();
+        let start = ledger - ledger % policy.window_ledgers;
+        let used = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaRateUsage(schema, start))
+            .unwrap_or(0);
+        Ok(SchemaRateLimitUsage {
+            window_start_ledger: start,
+            reset_ledger: start.saturating_add(policy.window_ledgers),
+            registrations: used,
+            remaining: policy.max_registrations.saturating_sub(used),
+        })
     }
 
     fn extend_instance_ttl(env: Env) {
@@ -2553,6 +2663,8 @@ mod test {
         assert_eq!(client.get_registry_epoch(), 0);
         let payload_result = client.try_get_proof_payload(&proof_id);
         assert_eq!(payload_result, Err(Ok(ProofError::ProofNotFound)));
+    }
+
     #[test]
     fn configuration_digest_matches_host_helper_and_version_changes() {
         let (env, client, _pc, _ir, ir_id) = setup();
@@ -2653,6 +2765,9 @@ mod test {
         assert_eq!(
             client.proof_validity(&proof_id),
             ProofValidity::IssuerInactive
+        );
+    }
+
     // ── issue 178: dependency interface version handshake ──────────────────────
 
     use earnproof_shared::InterfaceVersion;
@@ -2797,6 +2912,9 @@ mod test {
         }));
         assert!(result.is_err());
         assert_eq!(env.events().all().events().len(), 0);
+    }
+
+    #[test]
     fn initialization_rejects_incompatible_dependency_before_state_mutation() {
         let env = Env::default();
         env.mock_all_auths();
