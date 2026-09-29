@@ -69,6 +69,29 @@ pub const GENESIS_ID_VERSION: u32 = 1;
 /// version that has no explicit override configured in protocol-config.
 pub const DEFAULT_SCHEMA_PAYLOAD_LIMIT: u32 = 4096;
 
+/// Default deterministic ledger window used when a schema has no governed rate
+/// limit. A zero maximum means registrations are paused for that schema.
+pub const DEFAULT_SCHEMA_RATE_WINDOW_LEDGERS: u32 = 1_000;
+pub const DEFAULT_SCHEMA_RATE_LIMIT: u32 = u32::MAX;
+
+/// Governed, fixed-size issuance policy for one schema version.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaRateLimit {
+    pub max_registrations: u32,
+    pub window_ledgers: u32,
+}
+
+/// Observable usage for the current deterministic schema window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchemaRateLimitUsage {
+    pub window_start_ledger: u32,
+    pub reset_ledger: u32,
+    pub registrations: u32,
+    pub remaining: u32,
+}
+
 /// Computes a deterministic, domain-separated genesis identifier for a
 /// contract instance.
 ///

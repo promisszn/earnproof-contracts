@@ -33,6 +33,8 @@ enum DataKey {
     Genesis,
     /// Governed per-schema-version auxiliary payload size bound (bytes).
     SchemaPayloadLimit(u32),
+    /// Governed registration-rate policy for a schema version.
+    SchemaRateLimit(u32),
     /// Ring-buffer slot holding one bounded change-history summary.
     ConfigHistoryRing(u32),
     /// Monotonic count of change-history entries ever appended.
@@ -471,6 +473,29 @@ impl ProtocolConfigContract {
             );
         }
         approved
+    }
+
+    /// Sets a bounded ledger-window registration limit for a schema. A zero
+    /// maximum intentionally pauses new registrations; a zero window is invalid.
+    pub fn set_schema_rate_limit(env: Env, version: u32, limit: SchemaRateLimit) -> Result<(), ContractError> {
+        Self::ensure_not_decommissioned(&env)?;
+        let admin = Self::get_admin(env.clone())?;
+        Self::require_auth(&admin);
+        Self::ensure_nonzero_version(version)?;
+        if limit.window_ledgers == 0 { return Err(ContractError::InvalidInput); }
+        env.storage().persistent().set(&DataKey::SchemaRateLimit(version), &limit);
+        env.storage().persistent().extend_ttl(&DataKey::SchemaRateLimit(version), TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+        Self::bump_config_version(env);
+        Ok(())
+    }
+
+    /// Returns the configured schema rate policy or the unbounded compatibility default.
+    pub fn get_schema_rate_limit(env: Env, version: u32) -> SchemaRateLimit {
+        if version == 0 { return SchemaRateLimit { max_registrations: DEFAULT_SCHEMA_RATE_LIMIT, window_ledgers: DEFAULT_SCHEMA_RATE_WINDOW_LEDGERS }; }
+        let key = DataKey::SchemaRateLimit(version);
+        let value = env.storage().persistent().get(&key).unwrap_or(SchemaRateLimit { max_registrations: DEFAULT_SCHEMA_RATE_LIMIT, window_ledgers: DEFAULT_SCHEMA_RATE_WINDOW_LEDGERS });
+        if env.storage().persistent().has(&key) { env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS); }
+        value
     }
 
     pub fn get_config_version(env: Env) -> u32 {
