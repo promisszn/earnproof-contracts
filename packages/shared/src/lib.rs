@@ -548,6 +548,25 @@ pub struct UpgradeApproval {
     pub approved_by: Address,
 }
 
+/// Privacy-safe issuer signing-key commitment. Only a key digest and algorithm
+/// identifier are persisted; raw public or private keys are never accepted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SigningKeyCommitment {
+    pub key_hash: BytesN<32>,
+    pub algorithm: u32,
+    pub activated_ledger: u32,
+}
+
+/// Versioned opaque commitments for issuer classification policy documents.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuerPolicyCommitments {
+    pub encoding_version: u32,
+    pub category_commitment: BytesN<32>,
+    pub jurisdiction_commitment: BytesN<32>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IssuerRecord {

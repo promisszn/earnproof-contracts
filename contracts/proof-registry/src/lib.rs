@@ -60,6 +60,9 @@ enum DataKey {
     /// payload (length and commitment hash only — never the raw bytes).
     ProofPayloadMeta(BytesN<32>),
     SchemaRateUsage(u32, u32),
+    IssuerProofCaps(Address),
+    IssuerActiveProofCount(Address),
+    IssuerLifetimeProofCount(Address),
     PendingAdmin,
 }
 
@@ -359,6 +362,7 @@ impl ProofRegistryContract {
         }
 
         Self::consume_schema_rate_limit(&env, &protocol_client, schema_version)?;
+        Self::consume_issuer_proof_capacity(&env, &issuer_address)?;
 
         // Creation timing is sourced only from the host ledger environment so
         // it is deterministic and non-forgeable by the caller. The proof
@@ -455,6 +459,7 @@ impl ProofRegistryContract {
         }
 
         Self::consume_schema_rate_limit(&env, &protocol_client, schema_version)?;
+        Self::consume_issuer_proof_capacity(&env, &issuer_address)?;
 
         let now = env.ledger().timestamp();
         let record = ProofRecord {
@@ -957,6 +962,11 @@ impl ProofRegistryContract {
 
         record.status = ProofStatus::Revoked;
         record.revoked_at = env.ledger().timestamp();
+        let active_key = DataKey::IssuerActiveProofCount(record.issuer_address.clone());
+        let active: u32 = env.storage().persistent().get(&active_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&active_key, &active.saturating_sub(1));
         env.storage().persistent().set(&key, &record);
         Self::extend_proof_key_ttl(env.clone(), &key);
         let epoch = Self::bump_registry_epoch(&env);
@@ -966,6 +976,69 @@ impl ProofRegistryContract {
             epoch,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    /// Admin-only issuer proof capacity. Reductions below active usage are rejected.
+    pub fn set_issuer_proof_caps(
+        env: Env,
+        issuer: Address,
+        max_active: u32,
+        max_lifetime: u32,
+    ) -> Result<(), ProofError> {
+        let admin = Self::get_admin(env.clone()).map_err(|_| ProofError::ProofNotFound)?;
+        Self::require_auth(&admin);
+        let active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerActiveProofCount(issuer.clone()))
+            .unwrap_or(0);
+        let lifetime: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerLifetimeProofCount(issuer.clone()))
+            .unwrap_or(0);
+        if max_active < active || max_lifetime < lifetime {
+            return Err(ProofError::MalformedInput);
+        }
+        env.storage().persistent().set(
+            &DataKey::IssuerProofCaps(issuer),
+            &(max_active, max_lifetime),
+        );
+        Ok(())
+    }
+    pub fn get_issuer_proof_usage(env: Env, issuer: Address) -> (u32, u32, u32, u32) {
+        let (max_active, max_lifetime) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerProofCaps(issuer.clone()))
+            .unwrap_or((u32::MAX, u32::MAX));
+        let active = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerActiveProofCount(issuer.clone()))
+            .unwrap_or(0);
+        let lifetime = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IssuerLifetimeProofCount(issuer))
+            .unwrap_or(0);
+        (active, lifetime, max_active, max_lifetime)
+    }
+    fn consume_issuer_proof_capacity(env: &Env, issuer: &Address) -> Result<(), ProofError> {
+        let (active, lifetime, max_active, max_lifetime) =
+            Self::get_issuer_proof_usage(env.clone(), issuer.clone());
+        if active >= max_active || lifetime >= max_lifetime {
+            return Err(ProofError::MalformedInput);
+        }
+        env.storage().persistent().set(
+            &DataKey::IssuerActiveProofCount(issuer.clone()),
+            &active.checked_add(1).ok_or(ProofError::MalformedInput)?,
+        );
+        env.storage().persistent().set(
+            &DataKey::IssuerLifetimeProofCount(issuer.clone()),
+            &lifetime.checked_add(1).ok_or(ProofError::MalformedInput)?,
+        );
         Ok(())
     }
 

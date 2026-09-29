@@ -1,13 +1,13 @@
 #![no_std]
 
 use earnproof_shared::{
-    ContractError, GenesisRecord, InterfaceVersion, IssuerError, IssuerRecord, IssuerStatus,
-    MigrationStatus, TtlStatus, UpgradeApproval, UpgradeReceipt, ISSUER_REGISTRY_INTERFACE_VERSION,
-    MAX_MIGRATION_BATCH, METADATA_REVISION_INITIAL, MIGRATION_STATUS_VERSION,
-    TTL_EXTEND_TO_LEDGERS, TTL_THRESHOLD_LEDGERS, UPGRADE_APPROVAL_EXPIRY_LEDGERS,
-    UPGRADE_TIMELOCK_LEDGERS,
+    ContractError, GenesisRecord, InterfaceVersion, IssuerError, IssuerPolicyCommitments,
+    IssuerRecord, IssuerStatus, MigrationStatus, SigningKeyCommitment, TtlStatus, UpgradeApproval,
+    UpgradeReceipt, ISSUER_REGISTRY_INTERFACE_VERSION, MAX_MIGRATION_BATCH,
+    METADATA_REVISION_INITIAL, MIGRATION_STATUS_VERSION, TTL_EXTEND_TO_LEDGERS,
+    TTL_THRESHOLD_LEDGERS, UPGRADE_APPROVAL_EXPIRY_LEDGERS, UPGRADE_TIMELOCK_LEDGERS,
 };
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, BytesN, Env};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, BytesN, Env, Vec};
 
 #[contract]
 pub struct IssuerRegistryContract;
@@ -33,6 +33,11 @@ enum DataKey {
     UpgradeApproval,
     /// Immutable deployment identity, written once at `initialize`.
     Genesis,
+    ActiveSigningKey(BytesN<32>),
+    PendingSigningKey(BytesN<32>),
+    SigningKeyHistory(BytesN<32>, u32),
+    SigningKeyHistoryCount(BytesN<32>),
+    IssuerPolicy(BytesN<32>),
     IssuerEpoch,
     MaxActiveIssuers,
     ActiveIssuerCount,
@@ -637,6 +642,131 @@ impl IssuerRegistryContract {
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Begins a governed two-step signing-key rotation. The pending commitment
+    /// is not active until `activate_issuer_signing_key` commits it.
+    pub fn propose_issuer_signing_key(
+        env: Env,
+        issuer_id: BytesN<32>,
+        key_hash: BytesN<32>,
+        algorithm: u32,
+    ) -> Result<(), IssuerError> {
+        Self::assert_operational(&env);
+        let admin = Self::get_admin(env.clone()).map_err(|_| IssuerError::IssuerNotFound)?;
+        Self::require_auth(&admin);
+        if algorithm == 0 || Self::is_zero_hash(&env, &key_hash) {
+            return Err(IssuerError::InvalidMetadataCommitment);
+        }
+        Self::get_issuer(env.clone(), issuer_id.clone())?;
+        env.storage().persistent().set(
+            &DataKey::PendingSigningKey(issuer_id),
+            &SigningKeyCommitment {
+                key_hash,
+                algorithm,
+                activated_ledger: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Activates a previously proposed key once. The pending entry is removed,
+    /// so a retired commitment cannot be replayed into the active position.
+    pub fn activate_issuer_signing_key(env: Env, issuer_id: BytesN<32>) -> Result<(), IssuerError> {
+        Self::assert_operational(&env);
+        let admin = Self::get_admin(env.clone()).map_err(|_| IssuerError::IssuerNotFound)?;
+        Self::require_auth(&admin);
+        let pending_key = DataKey::PendingSigningKey(issuer_id.clone());
+        let mut next: SigningKeyCommitment = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .ok_or(IssuerError::InvalidTransition)?;
+        next.activated_ledger = env.ledger().sequence();
+        let active_key = DataKey::ActiveSigningKey(issuer_id.clone());
+        if let Some(previous) = env
+            .storage()
+            .persistent()
+            .get::<_, SigningKeyCommitment>(&active_key)
+        {
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SigningKeyHistoryCount(issuer_id.clone()))
+                .unwrap_or(0);
+            if count < 4 {
+                env.storage().persistent().set(
+                    &DataKey::SigningKeyHistory(issuer_id.clone(), count),
+                    &previous,
+                );
+                env.storage().persistent().set(
+                    &DataKey::SigningKeyHistoryCount(issuer_id.clone()),
+                    &(count + 1),
+                );
+            }
+        }
+        env.storage().persistent().set(&active_key, &next);
+        env.storage().persistent().remove(&pending_key);
+        Ok(())
+    }
+
+    pub fn get_active_issuer_signing_key(
+        env: Env,
+        issuer_id: BytesN<32>,
+    ) -> Option<SigningKeyCommitment> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveSigningKey(issuer_id))
+    }
+    pub fn get_prior_issuer_signing_keys(
+        env: Env,
+        issuer_id: BytesN<32>,
+    ) -> Vec<SigningKeyCommitment> {
+        let mut result = Vec::new(&env);
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SigningKeyHistoryCount(issuer_id.clone()))
+            .unwrap_or(0);
+        for index in 0..count {
+            if let Some(item) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SigningKeyHistory(issuer_id.clone(), index))
+            {
+                result.push_back(item);
+            }
+        }
+        result
+    }
+
+    pub fn set_issuer_policy_commitments(
+        env: Env,
+        issuer_id: BytesN<32>,
+        commitments: IssuerPolicyCommitments,
+    ) -> Result<(), IssuerError> {
+        Self::assert_operational(&env);
+        let admin = Self::get_admin(env.clone()).map_err(|_| IssuerError::IssuerNotFound)?;
+        Self::require_auth(&admin);
+        if commitments.encoding_version != 1
+            || Self::is_zero_hash(&env, &commitments.category_commitment)
+            || Self::is_zero_hash(&env, &commitments.jurisdiction_commitment)
+        {
+            return Err(IssuerError::InvalidMetadataCommitment);
+        }
+        Self::get_issuer(env.clone(), issuer_id.clone())?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::IssuerPolicy(issuer_id), &commitments);
+        Ok(())
+    }
+    pub fn get_issuer_policy_commitments(
+        env: Env,
+        issuer_id: BytesN<32>,
+    ) -> Option<IssuerPolicyCommitments> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IssuerPolicy(issuer_id))
     }
 
     pub fn suspend_issuer(
